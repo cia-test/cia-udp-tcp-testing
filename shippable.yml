@@ -1,0 +1,24 @@
+env:
+  - env1=foo
+  - env2=bar
+
+matrix:
+
+build:
+
+  pre_ci:
+    - echo "PRECI"
+
+  ci:
+    - echo "CI"
+    - echo $ENV1
+    - echo $ENV2
+    - ls -l
+  post_ci:
+    - echo "POSTCI"
+  on_success:
+    - echo "yay"
+  on_failure:
+    - echo "ohno"
+  always:
+    - echo "always"
