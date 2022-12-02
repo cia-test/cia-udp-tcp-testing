@@ -13,8 +13,6 @@ ssl_context.load_cert_chain(certfile='server.crt', keyfile='server.key')
 
 class BSDLibTestProtocol(asyncio.DatagramProtocol):
     counter = 0
-    def __init__(self):
-        super().__init__()
     def connection_made(self, transport):
         self.transport = transport
     def datagram_received(self, data, addr):
@@ -62,25 +60,20 @@ async def udp_sample_test_protocol(reader, writer):
     print("done")
 
 def start_server():
-    loop = asyncio.get_event_loop()
-    bsdlib_ipv4_udp = loop.create_datagram_endpoint(BSDLibTestProtocol,local_addr=('0.0.0.0',BSDLIB_PORT))
-    bsdlib_ipv6_udp = loop.create_datagram_endpoint(BSDLibTestProtocol,local_addr=('::',BSDLIB_PORT))
-    bsdlib_ipv4_tcp = asyncio.start_server(bsdlib_test_protocol_tls, '0.0.0.0', BSDLIB_PORT, loop=loop)
-    bsdlib_ipv6_tcp = asyncio.start_server(bsdlib_test_protocol_tls, '::', BSDLIB_PORT, loop=loop)
-    bsdlib_ipv4_tcp_ssl = asyncio.start_server(bsdlib_test_protocol_tls, '0.0.0.0', BSDLIB_PORT_SSL, loop=loop, ssl=ssl_context)
-    bsdlib_ipv6_tcp_ssl = asyncio.start_server(bsdlib_test_protocol_tls, '::', BSDLIB_PORT_SSL, loop=loop, ssl=ssl_context)
-    udpsample_dut = loop.create_datagram_endpoint(UDPSampleDUTProtocol,local_addr=('0.0.0.0',UDP_SAMPLE_DUT_PORT))
-    udpsample_test = asyncio.start_server(udp_sample_test_protocol, '0.0.0.0', UDP_SAMPLE_TEST_PORT, loop=loop)
-    
-    loop.run_until_complete(bsdlib_ipv4_tcp)
-    loop.run_until_complete(bsdlib_ipv4_udp)
-    loop.run_until_complete(bsdlib_ipv6_tcp)
-    loop.run_until_complete(bsdlib_ipv6_udp)
-    loop.run_until_complete(bsdlib_ipv4_tcp_ssl)
-    loop.run_until_complete(bsdlib_ipv6_tcp_ssl)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    bsdlib_udp = asyncio.Task(loop.create_datagram_endpoint(BSDLibTestProtocol,local_addr=('::', BSDLIB_PORT)))
+    bsdlib_tcp = asyncio.Task(asyncio.start_server(bsdlib_test_protocol_tls, '::', BSDLIB_PORT))
+    bsdlib_tcp_ssl = asyncio.Task(asyncio.start_server(bsdlib_test_protocol_tls, '::', BSDLIB_PORT_SSL, ssl=ssl_context))
+    udpsample_dut = asyncio.Task(loop.create_datagram_endpoint(UDPSampleDUTProtocol,local_addr=('::', UDP_SAMPLE_DUT_PORT)))
+    udpsample_test = asyncio.Task(asyncio.start_server(udp_sample_test_protocol, '::', UDP_SAMPLE_TEST_PORT))
+
+    loop.run_until_complete(bsdlib_udp)
+    loop.run_until_complete(bsdlib_tcp)
+    loop.run_until_complete(bsdlib_tcp_ssl)
     loop.run_until_complete(udpsample_dut)
     loop.run_until_complete(udpsample_test)
-
+    
     try:
         loop.run_forever()
     except KeyboardInterrupt:
