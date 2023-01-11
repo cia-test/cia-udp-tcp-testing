@@ -31,14 +31,10 @@ def start_container():
 async def udp_endpoint():
     reader, writer = await asyncio.open_connection("localhost", 5668)
     message = b"\0" * 10
-    print(f"Send: {message!r}")
     writer.write(message)
     await writer.drain()
-
     data = await reader.read(1024)
-    print(f"Received: {data}")
-
-    print("Close the connection")
+    assert data == b"none"
     writer.close()
     await writer.wait_closed()
 
@@ -47,23 +43,21 @@ def test_udp_endpoint(start_container):
     asyncio.run(udp_endpoint())
 
 
-async def pong_endpoint():
+async def pong_tcp_endpoint():
     reader, writer = await asyncio.open_connection("localhost", 2442)
-    message = b"\0" * 10
+    message = b"foobar"
     print(f"Send: {message!r}")
     writer.write(message)
     await writer.drain()
 
     data = await reader.read(1024)
-    print(f"Received: {data}")
-
-    print("Close the connection")
+    assert data == b"PONG: foobar"
     writer.close()
     await writer.wait_closed()
 
 
-def test_pong_endpoint(start_container):
-    asyncio.run(pong_endpoint())
+def test_pong_tcp_endpoint(start_container):
+    asyncio.run(pong_tcp_endpoint())
 
 
 class EchoClientProtocol:
@@ -85,19 +79,23 @@ def test_echo_client_protocol(start_container):
     asyncio.run(echo_client_protocol())
 
 
-async def dut_endpoint():
+async def dut_endpoint(msg):
     reader, writer = await asyncio.open_connection("localhost", 5668)
-    message = b"foobar123"
+    message = msg
     print(f"Send: {message!r}")
     writer.write(message)
     await writer.drain()
-
     data = await reader.read(4096)
-    print(f"Received: {data}")
-    assert b"\\x00\\x00\\x00" in data
     writer.close()
     await writer.wait_closed()
-
+    return data
 
 def test_dut_proto():
-    asyncio.run(dut_endpoint())
+    data = asyncio.run(dut_endpoint(b"asdf"))
+    assert b"none" in data
+    data = asyncio.run(dut_endpoint(b"foobar"))
+    assert data
+    asyncio.run(echo_client_protocol())
+    data = asyncio.run(dut_endpoint(b"foobar"))
+    assert b"\\x00\\x00\\x00" in data
+

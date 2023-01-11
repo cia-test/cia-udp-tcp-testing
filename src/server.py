@@ -54,13 +54,12 @@ async def udp_sample_test_protocol(reader, writer):
     else:
         writer.write(to_send)
     await writer.drain()
-    print("done")
 
 
 def tcp_pong():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         print("started")
-        s.bind(("localhost", BSDLIB_PORT))
+        s.bind(("0.0.0.0", BSDLIB_PORT))
         s.listen()
         print("accept")
         while True:
@@ -80,7 +79,7 @@ def tcp_pong():
 def tcp_udp_sample():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         print("started")
-        s.bind(("localhost", UDP_SAMPLE_TEST_PORT))
+        s.bind(("0.0.0.0", UDP_SAMPLE_TEST_PORT))
         s.listen()
         while True:
             conn, addr = s.accept()
@@ -105,13 +104,13 @@ def tcp_udp_sample():
 async def start_server():
     loop = asyncio.get_running_loop()
     udpsample_dut = await loop.create_datagram_endpoint(
-        UdpSampleTest, local_addr=("::", UDP_SAMPLE_DUT_PORT)
+        UdpSampleTest, local_addr=("0.0.0.0", UDP_SAMPLE_DUT_PORT)
     )
     bsdlib_udp = await loop.create_datagram_endpoint(
-        UdpPong, local_addr=("::", BSDLIB_PORT)
+        UdpPong, local_addr=("0.0.0.0", BSDLIB_PORT)
     )
     udpsample_test = await asyncio.start_server(
-        udp_sample_test_protocol, "localhost", UDP_SAMPLE_TEST_PORT
+        udp_sample_test_protocol, "0.0.0.0", UDP_SAMPLE_TEST_PORT, family=socket.AF_INET
     )
     async with udpsample_test:  # , udpsample_test:
         await udpsample_test.serve_forever()  # , udpsample_test.serve_forever()
