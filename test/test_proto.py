@@ -29,7 +29,7 @@ def start_container():
 
 
 async def udp_endpoint():
-    reader, writer = await asyncio.open_connection("localhost", 5668)
+    reader, writer = await asyncio.open_connection("localhost", 3002)
     message = b"\0" * 10
     writer.write(message)
     await writer.drain()
@@ -44,7 +44,7 @@ def test_udp_endpoint(start_container):
 
 
 async def pong_tcp_endpoint():
-    reader, writer = await asyncio.open_connection("localhost", 2442)
+    reader, writer = await asyncio.open_connection("localhost", 3000)
     message = b"foobar"
     print(f"Send: {message!r}")
     writer.write(message)
@@ -70,7 +70,7 @@ async def echo_client_protocol():
     loop = asyncio.get_running_loop()
     message = b"\0" * 10
     transport, protocol = await loop.create_datagram_endpoint(
-        EchoClientProtocol, remote_addr=("localhost", 5667)
+        EchoClientProtocol, remote_addr=("localhost", 3001)
     )
     transport.close()
 
@@ -80,7 +80,7 @@ def test_echo_client_protocol(start_container):
 
 
 async def dut_endpoint(msg):
-    reader, writer = await asyncio.open_connection("localhost", 5668)
+    reader, writer = await asyncio.open_connection("localhost", 3002)
     message = msg
     print(f"Send: {message!r}")
     writer.write(message)

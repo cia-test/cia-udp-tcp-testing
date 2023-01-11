@@ -4,9 +4,9 @@ import threading
 import ssl
 import queue
 
-BSDLIB_PORT = 2442
-UDP_SAMPLE_DUT_PORT = 5667
-UDP_SAMPLE_TEST_PORT = 5668
+BSDLIB_PORT = 3000
+UDP_SAMPLE_DUT_PORT = 3001
+UDP_SAMPLE_TEST_PORT = 3002
 
 counter = 0
 data_q = asyncio.Queue()
