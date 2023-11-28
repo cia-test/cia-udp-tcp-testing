@@ -5,6 +5,7 @@ services:
     build: .
     ports:
       - "3000:3000/udp"
+      - "3000:3000/tcp"
       - "3001:3001/udp"
       - "3002:3002/tcp"
     command: python3 -u server.py
