@@ -1,14 +1,10 @@
 import asyncio
-import socket
-import threading
-import ssl
 import queue
 
-BSDLIB_PORT = 3000
+PONG_PROTOCOL_PORT = 3000
 UDP_SAMPLE_DUT_PORT = 3001
 UDP_SAMPLE_TEST_PORT = 3002
 
-counter = 0
 data_q = asyncio.Queue()
 
 
@@ -16,7 +12,7 @@ class UdpPong(asyncio.DatagramProtocol):
     counter = 0
 
     def connection_made(self, transport):
-        print("udp_pong connected")
+        print("udp: pong connected")
         self.transport = transport
 
     def datagram_received(self, data, addr):
@@ -27,11 +23,11 @@ class UdpPong(asyncio.DatagramProtocol):
 
 class UdpSampleTest(asyncio.DatagramProtocol):
     def connection_made(self, transport):
-        print("UDPSampleDUTProtocol connected")
+        print("udp: UdpSampleTest ready")
         self.transport = transport
 
     def datagram_received(self, data, addr):
-        print("dut rx")
+        print("udp: rx")
         if b"\x00\x00\x00" in data:
             asyncio.create_task(self.task_add(data))
 
@@ -41,7 +37,7 @@ class UdpSampleTest(asyncio.DatagramProtocol):
 
 async def udp_sample_test_protocol(reader, writer):
     data = await reader.read(2048)
-    print("tcp")
+    print("tcp: sampletest")
     to_send = bytearray()
     if b"foobar" in data:
         while True:
@@ -54,71 +50,46 @@ async def udp_sample_test_protocol(reader, writer):
     else:
         writer.write(to_send)
     await writer.drain()
+    writer.close()
 
 
-def tcp_pong():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        print("started")
-        s.bind(("0.0.0.0", BSDLIB_PORT))
-        s.listen()
-        print("accept")
-        while True:
-            conn, addr = s.accept()
-            with conn:
-                print(f"Connected by {addr}")
-                data = conn.recv(1024)
-                if not data:
-                    continue
-                try:
-                    resp = f"PONG: {data.decode()}"
-                except UnicodeDecodeError:
-                    resp = "Error unable to decode"
-                conn.sendall(resp.encode())
+async def tcp_pong(reader, writer):
+    data = await reader.read(2048)
+    print("tcp pong")
+    a = b"PONG: " + data
+    print(a.decode().strip())
+    writer.write(a)
+    await writer.drain()
+    writer.close()
 
 
-def tcp_udp_sample():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        print("started")
-        s.bind(("0.0.0.0", UDP_SAMPLE_TEST_PORT))
-        s.listen()
-        while True:
-            conn, addr = s.accept()
-            with conn:
-                print(f"Connected by {addr}")
-                data = conn.recv(1024)
-                if not "foobar" in data:
-                    conn.sendall(b"none")
-                    continue
-                resp = bytearray()
-                while True:
-                    try:
-                        resp.extend(f"Data: {data_q.get_nowait()}\n".encode())
-                    except queue.Empty:
-                        break
-                if resp:
-                    conn.sendall(resp)
-                else:
-                    conn.sendall(b"none")
-
-
-async def start_server():
+async def start_udp_tasks():
     loop = asyncio.get_running_loop()
+
     udpsample_dut = await loop.create_datagram_endpoint(
         UdpSampleTest, local_addr=("0.0.0.0", UDP_SAMPLE_DUT_PORT)
     )
     bsdlib_udp = await loop.create_datagram_endpoint(
-        UdpPong, local_addr=("0.0.0.0", BSDLIB_PORT)
+        UdpPong, local_addr=("0.0.0.0", PONG_PROTOCOL_PORT)
     )
+
+
+async def start_tcp_pong():
+    udpsample_test = await asyncio.start_server(tcp_pong, "0.0.0.0", PONG_PROTOCOL_PORT)
+    async with udpsample_test:
+        await udpsample_test.serve_forever()
+
+
+async def start_udpsample_test_protocol():
     udpsample_test = await asyncio.start_server(
-        udp_sample_test_protocol, "0.0.0.0", UDP_SAMPLE_TEST_PORT, family=socket.AF_INET
+        udp_sample_test_protocol, "0.0.0.0", UDP_SAMPLE_TEST_PORT
     )
-    async with udpsample_test:  # , udpsample_test:
-        await udpsample_test.serve_forever()  # , udpsample_test.serve_forever()
+    async with udpsample_test:
+        await udpsample_test.serve_forever()
 
 
 if __name__ == "__main__":
-    a = threading.Thread(target=tcp_pong)
-    a.start()
-    # a = threading.Thread(target=tcp_udp_sample)
-    # a.start()
-    asyncio.run(start_server())
+    asyncio.ensure_future(start_udp_tasks())
+    asyncio.ensure_future(start_tcp_pong())
+    asyncio.ensure_future(start_udpsample_test_protocol())
+    asyncio.get_event_loop().run_forever()
