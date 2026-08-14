@@ -24,7 +24,9 @@ ports are a traffic reflector and cannot be made safe by authentication.
 | `ALLOW_NO_AUTH` | unset | Set to `1` to run the API with no auth (refuses to start otherwise) |
 | `REST_TLS_CERT` / `REST_TLS_KEY` | *(none)* | Enable HTTPS; must be set together |
 | `ALLOWED_SOURCES` | *(empty = all)* | Comma-separated IPs/CIDRs allowed on **all** listeners |
-| `SAMPLE_STORE_LIMIT` | `1000` | Max retained samples; oldest are evicted and counted in `dropped` |
+| `SAMPLE_STORE_LIMIT` | `10000` | Max retained samples; oldest are evicted and counted in `dropped` |
+| `SAMPLE_STORE_BYTES` | `64 MiB` | Total payload budget; oldest evicted when exceeded |
+| `SAMPLE_RETENTION_S` | `900` | Age limit; must exceed a test's run time plus its polling |
 | `MAX_SAMPLE_BYTES` | `65536` | Per-sample size cap (also the HTTP body cap) |
 | `UDP_GLOBAL_RATE` | `500` | Datagrams/s across all sources, per listener (`0` disables) |
 | `UDP_PER_IP_RATE` | `100` | Datagrams/s per source IP, per listener (`0` disables) |
@@ -55,12 +57,36 @@ configured, `/health` included.
 Cumulative per-source traffic counters — the same data as the JSON log lines.
 See [Observing traffic](#observing-traffic).
 
+### `GET /api/v1/cursor`
+
+`{"last_id": 42, "server_time": "...", "stored": 17}` — the current end of the
+log, with no side effects. Take this before starting a DUT.
+
+### `GET /api/v1/flows`
+
+Samples grouped by source `(ip, port)`; one flow per DUT boot.
+
+- `since` — only flows that started after this sample id.
+- `min_packets` — only flows with at least this many packets in the window.
+- `include_ongoing` (default `false`) — also report flows that started earlier,
+  marked `"new": false`.
+
+```json
+{"count": 1, "since": 10, "min_packets": 3, "include_ongoing": false, "last_id": 25,
+ "flows": [{"ip": "10.0.0.5", "port": 41234, "packets": 15, "packets_since": 15,
+            "bytes": 150, "first_id": 11, "last_id": 25, "first_seen": "...",
+            "last_seen": "...", "new": true, "duration_s": 14.02}]}
+```
+
 ### `GET /api/v1/samples`
 
 Reads stored samples, oldest first.
 
-- `drain` (default `true`) — consume on read, matching the old TCP behaviour.
-  Use `drain=false` to inspect without consuming.
+- `since` — only samples newer than this id; never consumes. Cannot be combined
+  with `drain=true` (that returns `400`).
+- `drain` (default `true`, or `false` when `since` is given) — consume on read,
+  matching the old TCP behaviour. **Destroys samples belonging to other runs in
+  flight**; see [Concurrent test runs](#concurrent-test-runs).
 - `limit` — return at most N samples.
 
 ```json
@@ -90,15 +116,17 @@ an oversized body gets `413`.
 ## Test harness integration
 
 The old flow — open `tcp/3002`, send `b"foobar"`, parse the returned text blob —
-becomes an authenticated HTTP GET. The shape of a test is:
+becomes an authenticated HTTP GET. **If more than one test run can be in flight
+at a time, read [Concurrent test runs](#concurrent-test-runs) first**; the
+erase-run-read cycle below is only safe when runs are serialised.
 
-1. `DELETE /samples` so the run starts from an empty store.
+1. `GET /cursor` to note where the log ends.
 2. Trigger the DUT; it sends datagrams to `udp/3001` as before.
-3. Poll `GET /samples?drain=false` until the expected count arrives — **UDP
+3. Poll `GET /flows?since=<cursor>&min_packets=3` until a flow qualifies — **UDP
    delivery is asynchronous, so a single GET straight after the trigger will
    usually race and see nothing.**
-4. `GET /samples?drain=true` to consume them.
 
+Nothing is consumed, so concurrent runs do not destroy each other's data.
 Payloads are binary, so each sample carries `data_b64` and `data_hex` rather
 than raw bytes.
 
@@ -113,15 +141,29 @@ from harness_client import SampleApiClient
 
 api = SampleApiClient("testserver", token=os.environ["REST_API_TOKEN"])
 
-api.clear()                        # step 1
-dut.run_connectivity_test()        # step 2 — your existing DUT trigger
-payloads = api.collect(count=1)    # steps 3 + 4, returns [b'\x00\x00\x00...']
+cursor = api.cursor()                 # before power-on
+dut.run_connectivity_test()           # your existing trigger; board sends 1/s
+flows = api.wait_for_flow(cursor, min_packets=3, timeout=30)
 
-assert b"expected-marker" in payloads[0]
+assert flows, "no device sent 3 packets in this window"
+print(flows[0]["ip"], flows[0]["port"], flows[0]["packets"])
 ```
 
-`collect()` is `wait_for_samples()` followed by `drain()`. Use the pieces
-directly when you need the metadata (`id`, `received_at`, `source`, `length`):
+`wait_for_flow` polls `/flows` and consumes nothing, so it is safe with
+concurrent runs — subject to the attribution limit described in [Concurrent test
+runs](#concurrent-test-runs).
+
+When runs are serialised, the simpler consuming form still works. `collect()` is
+`wait_for_samples()` followed by `drain()`:
+
+```python
+api.clear()
+dut.run_connectivity_test()
+payloads = api.collect(count=3)     # [b'\x00\x00\x00...', ...]
+```
+
+Use the pieces directly when you need the metadata (`id`, `received_at`,
+`source`, `length`):
 
 ```python
 samples = api.wait_for_samples(count=2, timeout=10)   # blocks, does not consume
@@ -158,16 +200,19 @@ for sample in response.json()["samples"]:
 API=http://testserver:8080/api/v1
 AUTH="Authorization: Bearer $REST_API_TOKEN"
 
-# 1. start clean
-curl -sf -X DELETE -H "$AUTH" "$API/samples"
+# 1. note where the log ends, before power-on
+CURSOR=$(curl -sf -H "$AUTH" "$API/cursor" | jq .last_id)
 
-# 3. wait for the DUT's datagrams to land (poll, don't assume)
-for _ in $(seq 30); do
-  [ "$(curl -sf -H "$AUTH" "$API/samples?drain=false" | jq .count)" -gt 0 ] && break
+# 2. boot the board, then poll for a flow of >= 3 packets (don't assume)
+for _ in $(seq 60); do
+  FLOWS=$(curl -sf -H "$AUTH" "$API/flows?since=$CURSOR&min_packets=3")
+  [ "$(echo "$FLOWS" | jq .count)" -gt 0 ] && break
   sleep 0.5
 done
+echo "$FLOWS" | jq '.flows[] | {ip, port, packets, duration_s}'
 
-# 4. consume them
+# serialised runs only: the consuming form destroys other runs' samples
+curl -sf -X DELETE -H "$AUTH" "$API/samples"
 curl -sf -H "$AUTH" "$API/samples?drain=true" | jq
 
 # payloads as text
@@ -191,6 +236,93 @@ python3 test/harness_client.py --host testserver --token "$REST_API_TOKEN" drain
 python3 test/harness_client.py --token "$REST_API_TOKEN" stats
 python3 test/harness_client.py --token "$REST_API_TOKEN" clear
 ```
+
+## Concurrent test runs
+
+The workload: a board boots, sends a zero-payload datagram every second, and
+after 15 s the harness checks that at least 3 arrived. Several such runs overlap,
+and **every boot gets a fresh IP and source port**, so a run cannot recognise its
+own device by address.
+
+### Why erase-run-read produced false negatives
+
+`DELETE /samples` + run + `GET /samples?drain=true` mutates state shared by every
+run in flight. Run B's `DELETE` throws away packets run A is still waiting for,
+and B's drain consumes them. Both runs then report failures that never happened.
+Measured with `test/simulate_concurrent_runs.py` (4 runs, 1 dead board): **2 of 4
+runs wrong, both false negatives.**
+
+### The windowed, flow-grouped read
+
+Two changes remove the shared mutable state:
+
+- **Reads are non-destructive.** `GET /cursor` returns the current end of the
+  log; `?since=<cursor>` returns only what arrived afterwards. Neither consumes
+  anything, so any number of runs can read concurrently. The store is bounded by
+  age, count and bytes instead of by consumers draining it.
+- **Samples are grouped into flows.** One flow is one `(ip, port)` pair, which
+  for these devices is one boot. `GET /flows?since=&min_packets=3` asks the
+  question a test actually cares about — *did one device send 3 packets?* —
+  rather than *did 3 packets arrive from anyone?*
+
+Only flows whose **first ever** packet arrived after your cursor are returned.
+This matters: a neighbouring board that was already streaming when you took your
+cursor would otherwise look like a brand new flow inside your window and vouch
+for a board that never sent anything. Pass `include_ongoing=true` to see those,
+marked `"new": false`.
+
+```python
+cursor = api.cursor()                                   # before power-on
+boot_dut()
+flows = api.wait_for_flow(cursor, min_packets=3, timeout=30)
+```
+
+Measured on the same 4-run scenario: **0 false negatives**, in both
+simultaneous and staggered starts.
+
+### The limit, stated plainly
+
+This does not make the check sound. With no identity in the traffic, a run cannot
+distinguish *my board sent 3 packets* from *somebody's board sent 3 packets*. So
+the flakiness moves rather than vanishing: in the 4-run scenario with one dead
+board, the dead board's run **passes on a neighbour's flow** — one false positive
+in place of two false negatives.
+
+That is a better trade for CI stability but a worse failure mode, because the run
+that should have failed is exactly the one this test exists to catch. Reproduce
+both with:
+
+```sh
+python3 test/simulate_concurrent_runs.py --token "$REST_API_TOKEN" \
+    --runs 4 --broken-runs 3 --duration 15 --stagger 1
+```
+
+Closing the gap needs identity in the traffic, and both options are cheap if the
+harness already configures the DUT:
+
+1. **A destination port per run.** Give each concurrent slot its own UDP port
+   (3001, 3002, …) and tell the board which to use. Attribution becomes exact
+   and server-side — no payload change, no heuristics. Best option if the test
+   configuration already carries the server address.
+2. **An identifier in the payload.** Even two bytes of run id makes attribution
+   exact regardless of addressing. Requires touching the firmware or test
+   payload, which "zero-data packets" may not allow.
+
+Failing both, a server-side **exclusive flow claim** (each run claims one
+distinct flow, first-come) would guarantee that exactly one run fails per dead
+board, though possibly not the right one — enough for a retry to resolve it.
+Not implemented; ask if you want it.
+
+### Two things to check on the device side
+
+- **Truly empty datagrams are dropped.** The store requires the `\x00\x00\x00`
+  marker, so a zero-*length* payload is discarded outright and no read strategy
+  will help. A zero-*filled* payload of 3 bytes or more is fine. `n_no_marker`
+  in `/stats` counts these.
+- **The source port must be stable for a whole boot.** Flow grouping assumes one
+  socket per boot. If the firmware opens a new socket per packet, every packet
+  becomes its own flow and `min_packets` can never be met. Check
+  `distinct_source_ports` in `/stats` against the packet count.
 
 ## Observing traffic
 

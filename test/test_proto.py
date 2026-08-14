@@ -92,7 +92,10 @@ def test_health(server):
 
 def test_samples_empty(clean_store):
     body = get_samples(clean_store, drain=True)
-    assert body == {"count": 0, "drained": True, "remaining": 0, "samples": []}
+    assert body["count"] == 0
+    assert body["drained"] is True
+    assert body["remaining"] == 0
+    assert body["samples"] == []
 
 
 def test_udp_sample_is_stored_and_drained(clean_store):

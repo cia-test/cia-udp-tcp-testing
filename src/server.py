@@ -17,9 +17,13 @@ PONG_PROTOCOL_PORT = int(os.environ.get("PONG_PROTOCOL_PORT", 3000))
 UDP_SAMPLE_DUT_PORT = int(os.environ.get("UDP_SAMPLE_DUT_PORT", 3001))
 REST_API_PORT = int(os.environ.get("REST_API_PORT", 8080))
 
-# Upper bound on retained samples, so a chatty DUT cannot grow the store forever.
-# Worst-case memory is roughly SAMPLE_STORE_LIMIT * MAX_SAMPLE_BYTES.
-SAMPLE_STORE_LIMIT = int(os.environ.get("SAMPLE_STORE_LIMIT", 1000))
+# Retention. Reads are non-destructive, so the store is bounded by all three of
+# these instead of by consumers draining it: whichever limit is hit first evicts
+# the oldest samples. The age limit is the meaningful one for concurrent tests —
+# it must comfortably exceed a test's run time plus its polling.
+SAMPLE_STORE_LIMIT = int(os.environ.get("SAMPLE_STORE_LIMIT", 10000))
+SAMPLE_STORE_BYTES = int(os.environ.get("SAMPLE_STORE_BYTES", 64 * 1024 * 1024))
+SAMPLE_RETENTION_S = float(os.environ.get("SAMPLE_RETENTION_S", 900))
 MAX_SAMPLE_BYTES = int(os.environ.get("MAX_SAMPLE_BYTES", 65536))
 
 # A datagram on UDP_SAMPLE_DUT_PORT is only stored if it carries this marker.
@@ -278,50 +282,180 @@ async def stats_logger(stats, limiters, interval):
         )
 
 
-class SampleStore:
-    """Bounded, ordered store of samples received from the DUT."""
+class Sample:
+    """One stored datagram. `monotonic` is internal, for retention only."""
 
-    def __init__(self, maxlen):
-        self._samples = deque(maxlen=maxlen)
+    __slots__ = ("id", "received_at", "monotonic", "ip", "port", "length",
+                 "data_b64", "data_hex")
+
+    def __init__(self, sample_id, data, ip=None, port=None):
+        self.id = sample_id
+        self.received_at = _now()
+        self.monotonic = time.monotonic()
+        self.ip = ip
+        self.port = port
+        self.length = len(data)
+        self.data_b64 = base64.b64encode(data).decode()
+        self.data_hex = data.hex()
+
+    @property
+    def flow(self):
+        """The only identity a DUT has: its source address and port.
+
+        LTE devices get a fresh IP and port on every boot, so one flow is one
+        boot session, and packets from concurrent tests land in different flows.
+        """
+        return (self.ip, self.port)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "received_at": self.received_at,
+            "source": f"{self.ip}:{self.port}" if self.ip else None,
+            "ip": self.ip,
+            "port": self.port,
+            "length": self.length,
+            "data_b64": self.data_b64,
+            "data_hex": self.data_hex,
+        }
+
+
+class SampleStore:
+    """Ordered store of samples, bounded by count, bytes and age.
+
+    Reads are non-destructive by default (see `since`), because a drain-on-read
+    store cannot serve concurrent test runs: whoever reads first consumes
+    everyone else's packets.
+    """
+
+    def __init__(self, maxlen=None, max_bytes=None, retention_s=None):
+        self._maxlen = SAMPLE_STORE_LIMIT if maxlen is None else maxlen
+        self._max_bytes = SAMPLE_STORE_BYTES if max_bytes is None else max_bytes
+        self._retention_s = SAMPLE_RETENTION_S if retention_s is None else retention_s
+        self._samples = deque()
+        self._bytes = 0
         self._next_id = 1
         self.dropped = 0
+        self.evictions = {"count": 0, "bytes": 0, "expired": 0}
 
-    def add(self, data, source=None):
-        if len(self._samples) == self._samples.maxlen:
-            # deque discards the oldest entry for us; just account for it.
-            self.dropped += 1
-        sample = {
-            "id": self._next_id,
-            "received_at": _now(),
-            "source": source,
-            "length": len(data),
-            "data_b64": base64.b64encode(data).decode(),
-            "data_hex": data.hex(),
-        }
+    # -- writing ----------------------------------------------------------
+
+    def add(self, data, ip=None, port=None):
+        sample = Sample(self._next_id, data, ip, port)
         self._next_id += 1
         self._samples.append(sample)
-        return sample
+        self._bytes += sample.length
+        self._evict()
+        return sample.to_dict()
 
-    def peek(self, limit=None):
-        """Return samples without removing them (oldest first)."""
-        samples = list(self._samples)
-        return samples if limit is None else samples[:limit]
+    def _drop_oldest(self, reason):
+        sample = self._samples.popleft()
+        self._bytes -= sample.length
+        self.dropped += 1
+        self.evictions[reason] += 1
+
+    def _evict(self):
+        if self._retention_s > 0:
+            cutoff = time.monotonic() - self._retention_s
+            while self._samples and self._samples[0].monotonic < cutoff:
+                self._drop_oldest("expired")
+        while self._maxlen > 0 and len(self._samples) > self._maxlen:
+            self._drop_oldest("count")
+        while self._max_bytes > 0 and self._bytes > self._max_bytes and self._samples:
+            self._drop_oldest("bytes")
+
+    # -- reading ----------------------------------------------------------
+
+    @property
+    def last_id(self):
+        """Cursor: take this before starting a DUT, then read with since=it."""
+        return self._next_id - 1
+
+    def _select(self, since=0):
+        self._evict()
+        return [s for s in self._samples if s.id > since]
+
+    def peek(self, limit=None, since=0):
+        """Read samples without consuming them (oldest first)."""
+        selected = self._select(since)
+        if limit is not None:
+            selected = selected[:limit]
+        return [s.to_dict() for s in selected]
+
+    def count(self, since=0):
+        return len(self._select(since))
 
     def take(self, limit=None):
-        """Return and remove samples (oldest first)."""
+        """Read and consume samples. Unsafe when tests run concurrently."""
+        self._evict()
         if limit is None:
             limit = len(self._samples)
         taken = []
         for _ in range(min(limit, len(self._samples))):
-            taken.append(self._samples.popleft())
+            sample = self._samples.popleft()
+            self._bytes -= sample.length
+            taken.append(sample.to_dict())
         return taken
+
+    def flows(self, since=0, min_packets=1, include_ongoing=False):
+        """Group samples by source flow, oldest flow first.
+
+        A flow is one (ip, port) pair, which for these devices is one boot, and
+        grouping is what lets a run tell its own device's packets apart from the
+        packets of every other run in flight.
+
+        By default only flows whose *first ever* packet arrived after `since`
+        are returned. That distinction matters: a neighbouring device that was
+        already streaming when you took your cursor would otherwise look like a
+        brand new flow inside your window, and its packets would vouch for a
+        board that never sent anything. Pass include_ongoing=True to see those
+        too, reported with `new: false`.
+        """
+        grouped = {}
+        for sample in self._select(0):
+            flow = grouped.get(sample.flow)
+            if flow is None:
+                flow = grouped[sample.flow] = {
+                    "ip": sample.ip,
+                    "port": sample.port,
+                    "packets": 0,
+                    "packets_since": 0,
+                    "bytes": 0,
+                    "first_id": sample.id,
+                    "last_id": sample.id,
+                    "first_seen": sample.received_at,
+                    "last_seen": sample.received_at,
+                    "_first_monotonic": sample.monotonic,
+                    "_last_monotonic": sample.monotonic,
+                }
+            flow["packets"] += 1
+            flow["bytes"] += sample.length
+            flow["last_id"] = sample.id
+            flow["last_seen"] = sample.received_at
+            flow["_last_monotonic"] = sample.monotonic
+            if sample.id > since:
+                flow["packets_since"] += 1
+
+        result = []
+        for flow in sorted(grouped.values(), key=lambda f: f["first_id"]):
+            flow["new"] = flow["first_id"] > since
+            span = flow.pop("_last_monotonic") - flow.pop("_first_monotonic")
+            flow["duration_s"] = round(span, 3)
+            if not flow["new"] and not include_ongoing:
+                continue
+            if flow["packets_since"] < min_packets:
+                continue
+            result.append(flow)
+        return result
 
     def clear(self):
         count = len(self._samples)
         self._samples.clear()
+        self._bytes = 0
         return count
 
     def __len__(self):
+        self._evict()
         return len(self._samples)
 
 
@@ -399,10 +533,12 @@ class UdpSampleTest(asyncio.DatagramProtocol):
             return
 
         self.stats.record(self.listener, host, port, data, "ok")
-        source = f"{host}:{port}" if addr else None
-        sample = self.store.add(data, source)
+        sample = self.store.add(data, host, port)
         if LOG_EVERY_PACKET:
-            print(f"udp: stored sample {sample['id']} ({sample['length']} bytes) from {source}")
+            print(
+                f"udp: stored sample {sample['id']} ({sample['length']} bytes) "
+                f"from {sample['source']}"
+            )
 
 
 class TcpPong:
@@ -466,7 +602,9 @@ async def health(request):
         {
             "status": "ok",
             "stored": len(store),
+            "last_id": store.last_id,
             "dropped": store.dropped,
+            "evictions": store.evictions,
             "udp_throttled": {name: lim.throttled for name, lim in limiters.items()},
             "tracked_sources": len(stats),
             "ports": {
@@ -502,24 +640,75 @@ async def get_stats(request):
     )
 
 
-async def get_samples(request):
-    """GET /api/v1/samples[?drain=true][&limit=N]
+async def get_cursor(request):
+    """GET /api/v1/cursor — the current end of the log.
 
-    Reads the stored DUT samples. Draining (the default) mirrors the
-    consume-on-read behaviour of the TCP protocol this replaces; pass
-    drain=false to inspect without consuming.
+    Take this before starting a DUT, then read back with ?since=<last_id> to
+    see only what arrived afterwards. Has no side effects, so any number of
+    concurrent test runs can use it safely.
     """
     store = request.app["store"]
-    drain = _bool_param(request, "drain", True)
+    return web.json_response(
+        {"last_id": store.last_id, "server_time": _now(), "stored": len(store)}
+    )
+
+
+async def get_samples(request):
+    """GET /api/v1/samples[?since=N][?drain=true][&limit=N]
+
+    Reads the stored DUT samples. `since` returns only samples newer than that
+    id and never consumes anything — the safe mode when tests run concurrently.
+
+    Draining mirrors the consume-on-read behaviour of the TCP protocol this
+    replaces. It is still the default for compatibility, but it destroys
+    samples belonging to every other run in flight.
+    """
+    store = request.app["store"]
+    since = _int_param(request, "since")
+    drain = _bool_param(request, "drain", since is None)
     limit = _int_param(request, "limit")
 
-    samples = store.take(limit) if drain else store.peek(limit)
+    if since is not None and drain:
+        raise web.HTTPBadRequest(
+            reason="'since' cannot be combined with drain=true: a windowed read "
+            "must not consume samples other test runs still need"
+        )
+
+    samples = store.take(limit) if drain else store.peek(limit, since=since or 0)
     return web.json_response(
         {
             "count": len(samples),
             "drained": drain,
+            "since": since or 0,
             "remaining": len(store),
+            "last_id": store.last_id,
             "samples": samples,
+        }
+    )
+
+
+async def get_flows(request):
+    """GET /api/v1/flows[?since=N][&min_packets=N][&include_ongoing=false]
+
+    Samples grouped by source (ip, port). One flow is one DUT boot, which is
+    the closest thing to a device identity available here. Only flows that
+    started after `since` are returned unless include_ongoing is set.
+    """
+    store = request.app["store"]
+    since = _int_param(request, "since", 0)
+    min_packets = _int_param(request, "min_packets", 1)
+    include_ongoing = _bool_param(request, "include_ongoing", False)
+    flows = store.flows(
+        since=since, min_packets=min_packets, include_ongoing=include_ongoing
+    )
+    return web.json_response(
+        {
+            "count": len(flows),
+            "since": since,
+            "min_packets": min_packets,
+            "include_ongoing": include_ongoing,
+            "last_id": store.last_id,
+            "flows": flows,
         }
     )
 
@@ -572,8 +761,8 @@ async def post_sample(request):
         )
 
     peer = request.transport.get_extra_info("peername") if request.transport else None
-    source = f"{peer[0]}:{peer[1]} (rest)" if peer else "rest"
-    sample = store.add(data, source)
+    ip, port = (peer[0], peer[1]) if peer else (None, None)
+    sample = store.add(data, ip, port)
     return web.json_response(sample, status=201)
 
 
@@ -648,6 +837,8 @@ def build_app(store, limiters=None, token=REST_API_TOKEN, allowed=(), stats=None
         [
             web.get(f"{API_ROOT}/health", health),
             web.get(f"{API_ROOT}/stats", get_stats),
+            web.get(f"{API_ROOT}/cursor", get_cursor),
+            web.get(f"{API_ROOT}/flows", get_flows),
             web.get(f"{API_ROOT}/samples", get_samples),
             web.post(f"{API_ROOT}/samples", post_sample),
             web.delete(f"{API_ROOT}/samples", delete_samples),
