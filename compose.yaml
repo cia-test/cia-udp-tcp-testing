@@ -7,5 +7,32 @@ services:
       - "3000:3000/udp"
       - "3000:3000/tcp"
       - "3001:3001/udp"
-      - "3002:3002/tcp"
+      - "8080:8080/tcp"
+    environment:
+      # Required. Generate with:
+      #   python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
+      REST_API_TOKEN: "${REST_API_TOKEN:?set REST_API_TOKEN, or set ALLOW_NO_AUTH=1}"
+      # Leave empty during the observation run, then set it from what
+      # test/analyze_traffic.py reports. The pong port must stay public for the
+      # LTE devices, so this is the main control that actually closes it.
+      ALLOWED_SOURCES: "${ALLOWED_SOURCES:-}"
+      # Plaintext HTTP by default; the token is sniffable on the network path.
+      # Terminate TLS in a proxy, or mount a cert and set these two.
+      REST_TLS_CERT: "${REST_TLS_CERT:-}"
+      REST_TLS_KEY: "${REST_TLS_KEY:-}"
+      # Aggregate traffic accounting: one JSON line per active source per
+      # window. 300s over a few days is a few thousand lines, not millions.
+      STATS_INTERVAL: "${STATS_INTERVAL:-300}"
+      # Set to 1 only for short debugging runs: one log line per packet.
+      LOG_EVERY_PACKET: "${LOG_EVERY_PACKET:-0}"
+      # Sized for <10 devices at ~1 pps. See README "Rate limits".
+      UDP_GLOBAL_RATE: "${UDP_GLOBAL_RATE:-500}"
+      UDP_PER_IP_RATE: "${UDP_PER_IP_RATE:-100}"
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        # Keep a multi-day observation run bounded on disk.
+        max-size: "20m"
+        max-file: "5"
     command: python3 -u server.py
